@@ -1,0 +1,59 @@
+# ─── ATAC-seq Pipeline Configuration ──────────────────────────────────────────
+# Edit this file to match your dataset and compute environment.
+
+# ─── Sample sheet ──────────────────────────────────────────────────────────────
+samples: config/samples.csv        # CSV with columns: sample, condition, replicate
+
+# ─── Input / Output ────────────────────────────────────────────────────────────
+bam_dir:    data/bam               # directory containing raw input BAMs ({sample}.bam)
+results_dir: results               # root for all pipeline outputs
+
+# ─── Genome ────────────────────────────────────────────────────────────────────
+genome: hg38
+genome_size: hs                    # MACS3 effective genome size (hs / mm / dm / ce)
+blacklist: resources/hg38-blacklist.v2.bed
+tss_bed:   resources/hg38_tss_2kb.bed   # ±1 kb around TSSs (for TSS enrichment)
+chrom_sizes: resources/hg38.chrom.sizes
+
+# Mitochondrial chromosome name (used for chrM removal step)
+mito_chr: chrM
+
+# ─── Sequencing ────────────────────────────────────────────────────────────────
+paired_end: true   # true → BAMPE mode in MACS3 + -f 2 flag in samtools filter
+
+# ─── BAM Filtering ─────────────────────────────────────────────────────────────
+# SAM FLAG filters applied by samtools view after deduplication:
+#   -F 1804 = exclude: unmapped (4), mate-unmapped (8), not-primary (256),
+#             PCR/optical dup (1024), supplementary (512)  → 4+8+256+512+1024 = 1804
+#   -f 2    = require proper pair (PE only; comment out for SE data)
+filter_flags_exclude: 1804
+filter_flags_include: 2            # set to 0 and paired_end: false for single-end
+min_mapq: 30
+
+# ─── MACS3 peak calling ────────────────────────────────────────────────────────
+macs3:
+  format:    BAMPE    # BAMPE (paired-end) or BAM (single-end + --nomodel --shift -100 --extsize 200)
+  qvalue:    0.05
+  keep_dup:  all      # already deduplicated in preprocessing step
+  call_summits: true  # recommended for ATAC-seq narrow peaks
+
+# ─── Consensus peaks ───────────────────────────────────────────────────────────
+# Peaks present in at least this many samples within a condition are kept.
+consensus_min_samples: 2
+# Maximum gap (bp) for bedtools merge when building consensus peak sets.
+merge_gap: 100
+
+# ─── DiffBind ──────────────────────────────────────────────────────────────────
+diffbind:
+  fdr_threshold:  0.05
+  fold_threshold: 1.0        # |log2FC| threshold for significance
+  method:         DESeq2     # DESeq2 or edgeR
+  summits:        250        # re-center peaks around summits (±N bp; 0 to disable)
+  min_overlap:    2          # minimum number of samples a peak must appear in
+
+# ─── Resources ─────────────────────────────────────────────────────────────────
+threads: 8
+memory_mb: 16000
+
+# ─── MultiQC ───────────────────────────────────────────────────────────────────
+multiqc_title: "Bulk ATAC-seq QC Report"

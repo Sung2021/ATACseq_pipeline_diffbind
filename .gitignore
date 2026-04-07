@@ -1,0 +1,41 @@
+# ─── Pipeline outputs (do not commit) ─────────────────────────────────────────
+results/
+data/bam/
+
+# ─── Snakemake internals ───────────────────────────────────────────────────────
+.snakemake/
+*.snakemake_timestamp
+
+# ─── Conda environments (auto-created by --use-conda) ─────────────────────────
+.conda/
+
+# ─── Reference files (large; download separately) ─────────────────────────────
+resources/*.bed
+resources/*.chrom.sizes
+resources/*.fa
+resources/*.fai
+resources/*.gz
+
+# ─── R / Python temporary files ───────────────────────────────────────────────
+*.Rhistory
+*.RData.tmp
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# ─── Editor / OS files ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# ─── Logs (keep structure, ignore content) ────────────────────────────────────
+# Uncomment to also ignore log files:
+# results/logs/
+
+# ─── Cluster profiles ─────────────────────────────────────────────────────────
+slurm/

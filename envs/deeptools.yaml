@@ -1,0 +1,11 @@
+name: atac_deeptools
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - deeptools=3.5.4
+  - numpy=1.26
+  - matplotlib=3.8
+  - pandas=2.1

@@ -1,0 +1,10 @@
+name: atac_macs3
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - macs3=3.0.1
+  - bedtools=2.31.1
+  - numpy=1.26
