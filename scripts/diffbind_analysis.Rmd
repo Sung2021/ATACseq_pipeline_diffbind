@@ -1,0 +1,525 @@
+---
+title: "ATAC-seq Differential Analysis — DiffBind + ChIPseeker"
+author: "ATAC-seq Pipeline"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+    fig_width: 10
+    fig_height: 7
+params:
+  samplesheet: "results/diffbind/samplesheet.csv"
+  outdir: "results/diffbind"
+  fdr: 0.05
+  fold: 1.0
+  method: "DESeq2"
+  summits: 250
+  min_overlap: 2
+  threads: 8
+---
+
+```{r setup, include=FALSE}
+# ─── Global options ───────────────────────────────────────────────────────
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  out.width = "100%"
+)
+
+# ─── Load libraries ───────────────────────────────────────────────────────
+suppressPackageStartupMessages({
+  library(DiffBind)
+  library(BiocParallel)
+  library(ChIPseeker)
+  library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+  library(org.Hs.eg.db)
+  library(GenomicRanges)
+  library(IRanges)
+  library(ggplot2)
+  library(dplyr)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(ggrepel)
+  library(reshape2)
+  library(gridExtra)
+  library(knitr)
+})
+
+# ─── Parameters ───────────────────────────────────────────────────────────
+fdr_cutoff   <- params$fdr
+fold_cutoff  <- params$fold
+method_name  <- params$method
+n_threads    <- params$threads
+summits_bp   <- params$summits
+min_overlap  <- params$min_overlap
+
+# Setup output directories
+dir.create(file.path(params$outdir, "plots"),   showWarnings = FALSE, recursive = TRUE)
+dir.create(file.path(params$outdir, "results"), showWarnings = FALSE, recursive = TRUE)
+
+# Parallel workers
+if (n_threads > 1) {
+  register(MulticoreParam(workers = n_threads))
+} else {
+  register(SerialParam())
+}
+
+# Reference databases
+txdb  <- TxDb.Hsapiens.UCSC.hg38.knownGene
+annodb <- "org.Hs.eg.db"
+
+method_flag <- if (method_name == "DESeq2") DBA_DESEQ2 else DBA_EDGER
+```
+
+---
+
+# Overview
+
+This report presents a complete **differential accessibility analysis** of ATAC-seq data using:
+- **DiffBind**: Peak counting and normalization
+- **DESeq2/edgeR**: Differential analysis
+- **ChIPseeker**: Peak annotation
+
+**Parameters:**
+- FDR cutoff: `r fdr_cutoff`
+- Fold-change cutoff: `r fold_cutoff`
+- Method: `r method_name`
+- Peak re-centering: ±`r summits_bp` bp
+
+---
+
+# 1. Exploratory Data Analysis (EDA)
+
+## 1.1 Load Sample Information
+
+```{r load-samplesheet}
+# Load DiffBind object
+cat("Loading samplesheet from:", params$samplesheet, "\n")
+dba_obj <- dba(sampleSheet = params$samplesheet)
+print(dba_obj)
+
+# Extract sample metadata
+sample_info <- dba_obj$samples
+cat("\n")
+print(sample_info)
+```
+
+### Sample Summary Table
+
+```{r sample-summary-table, results='asis'}
+sample_table <- data.frame(
+  Sample = sample_info$SampleID,
+  Condition = sample_info$Condition,
+  Replicate = sample_info$Replicate,
+  BAM = sample_info$bamReads,
+  Reads = sample_info$bamReads
+)
+kable(sample_table, caption = "Sample Metadata Summary")
+```
+
+## 1.2 Count Reads in Peaks
+
+```{r count-reads}
+cat("Counting reads in peaks (SummarizeOverlaps) ...\n")
+count_args <- list(DBA = dba_obj, bUseSummarizeOverlaps = TRUE)
+if (summits_bp > 0) {
+  count_args$summits <- summits_bp
+  cat(sprintf("Re-centering peaks around summits ± %d bp\n", summits_bp))
+}
+dba_obj <- do.call(dba.count, count_args)
+print(dba_obj)
+```
+
+## 1.3 Normalize Read Counts
+
+```{r normalize}
+cat(sprintf("Normalising using %s ...\n", method_name))
+if (method_name == "DESeq2") {
+  dba_obj <- dba.normalize(dba_obj, method = DBA_DESEQ2)
+} else {
+  dba_obj <- dba.normalize(dba_obj, method = DBA_EDGER)
+}
+print(dba_obj)
+```
+
+## 1.4 Descriptive Statistics
+
+### Read Distribution by Sample and Condition
+
+```{r read-distribution}
+# Extract normalized counts
+norm_matrix <- dba.peakset(dba_obj, bRetrieve = TRUE)
+
+# Summary statistics
+cat("Normalised read counts summary (per sample):\n")
+col_sums <- colSums(assay(norm_matrix))
+col_means <- colMeans(assay(norm_matrix))
+stats_df <- data.frame(
+  Sample = names(col_sums),
+  Total_Reads = as.integer(col_sums),
+  Mean_Per_Peak = round(col_means, 2),
+  Median_Per_Peak = apply(assay(norm_matrix), 2, median),
+  SD_Per_Peak = round(apply(assay(norm_matrix), 2, sd), 2)
+)
+print(stats_df)
+
+# Add condition info
+stats_df$Condition <- sample_info$Condition[match(stats_df$Sample, sample_info$SampleID)]
+```
+
+### Histogram of Read Counts
+
+```{r read-count-histogram, fig.height=6, fig.width=10}
+# Convert to long format for ggplot
+count_long <- melt(as.matrix(assay(norm_matrix)))
+colnames(count_long) <- c("Peak", "Sample", "Count")
+count_long$Condition <- sample_info$Condition[match(count_long$Sample, sample_info$SampleID)]
+
+# Plot
+ggplot(count_long[count_long$Count > 0, ], aes(x = log10(Count + 1), fill = Condition)) +
+  geom_histogram(bins = 50, alpha = 0.7) +
+  facet_wrap(~Sample, scales = "free_y") +
+  theme_bw() +
+  labs(
+    title = "Distribution of Normalised Peak Counts",
+    x = "log10(Normalised Count + 1)",
+    y = "Frequency"
+  )
+```
+
+## 1.5 Peak Characteristics
+
+### Number of Peaks
+
+```{r peak-numbers}
+# Get consensus peak set
+consensus_peaks <- dba.peakset(dba_obj, bRetrieve = TRUE)
+n_peaks <- nrow(consensus_peaks)
+
+# Peaks per sample
+peaks_per_sample <- apply(assay(norm_matrix) > 0, 2, sum)
+
+cat(sprintf("Total consensus peaks: %d\n", n_peaks))
+cat("\nPeaks detected per sample:\n")
+print(peaks_per_sample)
+```
+
+### Peak Size Distribution
+
+```{r peak-size-distribution}
+# Extract peak widths
+peak_widths <- width(consensus_peaks)
+peak_stats <- data.frame(
+  Min = min(peak_widths),
+  Q1 = quantile(peak_widths, 0.25),
+  Median = median(peak_widths),
+  Mean = round(mean(peak_widths), 1),
+  Q3 = quantile(peak_widths, 0.75),
+  Max = max(peak_widths),
+  SD = round(sd(peak_widths), 1)
+)
+
+kable(peak_stats, caption = "Peak Size Statistics (bp)", digits = 0)
+
+# Histogram
+ggplot(data.frame(Width = peak_widths), aes(x = Width)) +
+  geom_histogram(bins = 100, fill = "steelblue", alpha = 0.7) +
+  scale_x_log10() +
+  theme_bw() +
+  labs(
+    title = "Distribution of Peak Widths",
+    x = "Peak Width (bp, log10 scale)",
+    y = "Frequency"
+  )
+```
+
+---
+
+# 2. Quality Control Plots
+
+## 2.1 Correlation Heatmap
+
+```{r qc-correlation, fig.height=8, fig.width=9}
+pdf(file.path(params$outdir, "plots", "correlation_heatmap.pdf"), width = 11, height = 10)
+dba.plotHeatmap(dba_obj, main = "Sample Pearson Correlation (Normalised Counts in Peaks)")
+dev.off()
+
+dba.plotHeatmap(dba_obj, main = "Sample Pearson Correlation (Normalised Counts in Peaks)")
+```
+
+**Interpretation:** Red = high correlation (similar peak patterns). Check that biological replicates cluster together.
+
+## 2.2 Principal Component Analysis (PCA)
+
+```{r qc-pca, fig.height=7, fig.width=8}
+pdf(file.path(params$outdir, "plots", "pca_plot.pdf"), width = 8, height = 7)
+dba.plotPCA(dba_obj, label = DBA_CONDITION, main = "PCA — All Samples (Normalised Counts)")
+dev.off()
+
+dba.plotPCA(dba_obj, label = DBA_CONDITION, main = "PCA — All Samples (Normalised Counts)")
+```
+
+**Interpretation:** Samples should cluster by condition. Great separation indicates strong condition effects.
+
+## 2.3 Peak Overlap (Venn/UpSet)
+
+```{r qc-venn, fig.height=7, fig.width=8, eval=TRUE}
+conditions <- unique(sample_info$Condition)
+if (length(conditions) <= 4) {
+  pdf(file.path(params$outdir, "plots", "peak_overlap_venn.pdf"), width = 8, height = 7)
+  tryCatch(
+    dba.plotVenn(dba_obj, dba_obj$masks$All, main = "Peak Overlap Across All Samples"),
+    error = function(e) message("Venn plot skipped: ", conditionMessage(e))
+  )
+  dev.off()
+  
+  dba.plotVenn(dba_obj, dba_obj$masks$All, main = "Peak Overlap Across All Samples")
+} else {
+  cat("Venn plot skipped: > 4 samples — too complex\n")
+}
+```
+
+**Interpretation:** Overlapping circles show which peaks are shared across samples. High overlap suggests reproducible chromatin accessibility.
+
+## 2.4 Read Count Distribution
+
+```{r qc-boxplot, fig.height=6, fig.width=10}
+pdf(file.path(params$outdir, "plots", "count_boxplot.pdf"), width = 10, height = 6)
+dba.plotBox(dba_obj, main = "Normalised Read Counts in Peaks by Sample")
+dev.off()
+
+dba.plotBox(dba_obj, main = "Normalised Read Counts in Peaks by Sample")
+```
+
+---
+
+# 3. Differential Accessibility Analysis
+
+## 3.1 Define Contrasts
+
+```{r set-contrasts}
+cat(sprintf("Setting up pairwise contrasts (method: %s, min members: %d) ...\n", 
+            method_name, min_overlap))
+dba_obj <- dba.contrast(dba_obj, minMembers = min_overlap, method = method_flag)
+
+contrast_tbl <- dba.show(dba_obj, bContrasts = TRUE)
+cat("\nContrasts defined:\n")
+print(contrast_tbl)
+```
+
+## 3.2 Run Differential Analysis
+
+```{r differential-analysis}
+cat(sprintf("Running differential analysis using %s ...\n", method_name))
+dba_obj <- dba.analyze(dba_obj, method = method_flag, bParallel = FALSE)
+```
+
+## 3.3 Per-Contrast Results
+
+```{r per-contrast-results}
+all_results <- list()
+contrast_tbl <- dba.show(dba_obj, bContrasts = TRUE)
+
+for (i in seq_len(nrow(contrast_tbl))) {
+  grp1 <- as.character(contrast_tbl[i, "Group"])
+  grp2 <- as.character(contrast_tbl[i, "Group2"])
+  cname <- paste0(grp1, "_vs_", grp2)
+  
+  cat(sprintf("\n--- Contrast %d: %s ---\n", i, cname))
+
+  # Full results and significant results
+  res_all <- tryCatch(
+    dba.report(dba_obj, contrast = i, method = method_flag,
+               th = 1, bNormalized = TRUE, bCalled = FALSE),
+    error = function(e) { message("ERROR dba.report: ", e$message); NULL }
+  )
+  if (is.null(res_all)) next
+
+  res_sig <- dba.report(dba_obj, contrast = i, method = method_flag,
+                        th = fdr_cutoff, fold = fold_cutoff, bNormalized = TRUE)
+
+  # Convert to data frame
+  res_df <- as.data.frame(res_all)
+  res_sig_df <- as.data.frame(res_sig)
+  
+  res_df$contrast <- cname
+  res_sig_df$contrast <- cname
+  res_df$significant <- res_df$FDR <= fdr_cutoff & abs(res_df$Fold) >= fold_cutoff
+
+  all_results[[cname]] <- res_df
+
+  # Write CSVs
+  write.csv(res_df, 
+            file = file.path(params$outdir, "results", paste0(cname, "_all_peaks.csv")),
+            row.names = FALSE)
+  write.csv(res_sig_df,
+            file = file.path(params$outdir, "results", paste0(cname, "_significant_peaks.csv")),
+            row.names = FALSE)
+
+  cat(sprintf("  Total peaks: %d\n", nrow(res_df)))
+  cat(sprintf("  Significant peaks (FDR < %g, |log2FC| ≥ %g): %d\n",
+              fdr_cutoff, fold_cutoff, nrow(res_sig_df)))
+  cat(sprintf("    - Up-regulated:   %d\n", sum(res_sig_df$Fold > 0)))
+  cat(sprintf("    - Down-regulated: %d\n", sum(res_sig_df$Fold < 0)))
+}
+```
+
+### Summary Table
+
+```{r contrast-summary-table, results='asis'}
+summary_list <- list()
+for (cname in names(all_results)) {
+  res_df <- all_results[[cname]]
+  sig_peaks <- sum(res_df$significant)
+  up_peaks <- sum(res_df$significant & res_df$Fold > 0)
+  dn_peaks <- sum(res_df$significant & res_df$Fold < 0)
+  
+  summary_list[[cname]] <- data.frame(
+    Contrast = cname,
+    Total_Peaks = nrow(res_df),
+    Significant_Peaks = sig_peaks,
+    Up_regulated = up_peaks,
+    Down_regulated = dn_peaks
+  )
+}
+summary_df <- do.call(rbind, summary_list)
+rownames(summary_df) <- NULL
+kable(summary_df, caption = sprintf("Differential peaks (FDR<%g, |log2FC|≥%g)", 
+                                     fdr_cutoff, fold_cutoff))
+```
+
+---
+
+# 4. Volcano and MA Plots
+
+```{r volcano-plots, fig.height=6, fig.width=7}
+thresh_y <- -log10(fdr_cutoff + 1e-300)
+
+for (cname in names(all_results)) {
+  res_df <- all_results[[cname]]
+  
+  # Volcano plot
+  p_volcano <- ggplot(res_df, aes(x = Fold, y = -log10(FDR + 1e-300))) +
+    geom_point(aes(colour = significant), alpha = 0.5, size = 1) +
+    scale_colour_manual(
+      values = c("TRUE" = "#c0392b", "FALSE" = "grey60"),
+      labels = c("Not sig.",
+                 sprintf("FDR<%g  |log2FC|≥%g", fdr_cutoff, fold_cutoff)),
+      name = NULL
+    ) +
+    geom_vline(xintercept = c(-fold_cutoff, fold_cutoff),
+               linetype = "dashed", colour = "navy", linewidth = 0.3) +
+    geom_hline(yintercept = thresh_y,
+               linetype = "dashed", colour = "navy", linewidth = 0.3) +
+    labs(
+      title = sprintf("Volcano — %s", cname),
+      x = expression(log[2]~Fold~Change),
+      y = expression(-log[10](FDR))
+    ) +
+    theme_bw(base_size = 11)
+  
+  print(p_volcano)
+  
+  ggsave(file.path(params$outdir, "plots", paste0(cname, "_volcano.pdf")),
+         p_volcano, width = 7, height = 6)
+}
+```
+
+```{r ma-plots, fig.height=5, fig.width=7}
+for (i in seq_len(nrow(contrast_tbl))) {
+  pdf(file.path(params$outdir, "plots", 
+                paste0(names(all_results)[i], "_MA.pdf")), 
+      width = 7, height = 5)
+  dba.plotMA(dba_obj, contrast = i, method = method_flag, th = fdr_cutoff)
+  dev.off()
+}
+
+cat("MA plots saved to", file.path(params$outdir, "plots"), "\n")
+```
+
+---
+
+# 5. Peak Annotation
+
+```{r peak-annotation}
+cat("\nAnnotating significant peaks with ChIPseeker ...\n")
+
+for (cname in names(all_results)) {
+  res_df <- all_results[[cname]]
+  sig_df <- res_df[res_df$significant, , drop = FALSE]
+  
+  if (nrow(sig_df) < 5) {
+    cat(sprintf("  %s: only %d significant peaks — skipping annotation\n",
+                cname, nrow(sig_df)))
+    next
+  }
+  
+  cat(sprintf("  %s: annotating %d peaks ...\n", cname, nrow(sig_df)))
+  
+  # Convert to GRanges
+  sig_gr <- GRanges(
+    seqnames = sig_df$seqnames,
+    ranges = IRanges(sig_df$start, sig_df$end),
+    strand = "*"
+  )
+  
+  # Annotate
+  anno <- tryCatch(
+    annotatePeak(sig_gr, tssRegion = c(-3000, 3000),
+                 TxDb = txdb, annoDb = annodb, verbose = FALSE),
+    error = function(e) { message("  ERROR: ", e$message); NULL }
+  )
+  if (is.null(anno)) next
+  
+  anno_df <- as.data.frame(anno)
+  write.csv(anno_df,
+            file = file.path(params$outdir, "results",
+                             paste0(cname, "_significant_annotated.csv")),
+            row.names = FALSE)
+  
+  # Annotation bar plot
+  pdf(file.path(params$outdir, "plots", paste0(cname, "_annotation_bar.pdf")),
+      width = 8, height = 5)
+  plotAnnoBar(anno, title = sprintf("Peak Annotation — %s", cname))
+  dev.off()
+  
+  # TSS distance plot
+  pdf(file.path(params$outdir, "plots", paste0(cname, "_tss_distance.pdf")),
+      width = 8, height = 5)
+  plotDistToTSS(anno, title = sprintf("Distance to TSS — %s", cname))
+  dev.off()
+}
+```
+
+---
+
+# 6. Save Session Data
+
+```{r save-rdata}
+# Combine all results
+all_results_df <- do.call(rbind, all_results)
+write.csv(all_results_df,
+          file = file.path(params$outdir, "differential_peaks_all_contrasts.csv"),
+          row.names = FALSE)
+
+# Save RData for future interactive analysis
+save(dba_obj, all_results, file = file.path(params$outdir, "diffbind_analysis.RData"))
+
+cat("\n✓ RData saved to", file.path(params$outdir, "diffbind_analysis.RData"), "\n")
+cat("\nAll outputs saved to:", params$outdir, "\n")
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
+
