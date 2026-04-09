@@ -1,0 +1,76 @@
+# ─── FASTQ Quality Control & Preprocessing Configuration ─────────────────
+# Configuration for standalone FASTQ QC and preprocessing pipeline
+# (Snakefile_qualitycontrol)
+
+# ─── Input / Output ────────────────────────────────────────────────────────
+raw_fastq_dir: data/raw_fastq        # Directory containing input FASTQ files
+results_dir:   results/qc_preprocessing
+
+# Expected FASTQ naming convention:
+#   Paired-end:   {sample}_R1.fastq.gz, {sample}_R2.fastq.gz
+#   Single-end:   {sample}_R1.fastq.gz
+#
+# Example:
+#   SampleA_R1.fastq.gz
+#   SampleA_R2.fastq.gz
+#   SampleB_R1.fastq.gz
+#   SampleB_R2.fastq.gz
+
+# ─── Sequencing format ──────────────────────────────────────────────────────
+paired_end: true    # Set to false for single-end sequencing
+
+# ─── fastp parameters ──────────────────────────────────────────────────────
+# Quality filtering and read trimming
+min_quality: 20              # Minimum quality score (--qualified_quality_phred)
+min_length: 20               # Minimum read length after trimming (--length_required)
+
+# Additional fastp options (can be customized):
+# --detect_adapter_for_pe   : Auto-detect adapters in paired-end (enabled in rule)
+# --adapter_sequence auto   : Auto-detect sequencing adapters (enabled in rule)
+
+# ─── FastQC and MultiQC ────────────────────────────────────────────────────
+# FastQC: Quality assessment tool
+# MultiQC: Aggregates FastQC results into a single HTML report
+
+run_qc_after_trimming: true  # Re-run FastQC on trimmed reads for comparison
+
+# ─── Computational resources ───────────────────────────────────────────────
+threads:
+  fastqc: 2         # Per sample (can be increased)
+  fastp: 4          # Per sample (recommended: 4-8)
+
+memory_mb:
+  fastqc: 4000      # Per sample
+  fastp: 8000       # Per sample
+
+# ─── Notes ─────────────────────────────────────────────────────────────────
+# 
+# This pipeline performs:
+#   1. FastQC (quality assessment)
+#   2. MultiQC (aggregation)
+#   3. QC metrics parsing
+#   4. fastp parameter determination (based on QC metrics)
+#   5. fastp execution (adapter trimming + quality filtering)
+#   6. Re-run FastQC on trimmed reads
+#
+# Output directory structure:
+#   results/qc_preprocessing/
+#   ├── qc/
+#   │   ├── fastqc/              → HTML reports
+#   │   └── multiqc/             → Aggregated reports
+#   ├── trimmed/                 → fastp-processed FASTQ
+#   │   ├── {sample}_R1.trimmed.fastq.gz
+#   │   ├── {sample}_R2.trimmed.fastq.gz
+#   │   ├── {sample}.fastp.json
+#   │   └── {sample}.fastp.html
+#   └── qc_metrics/              → Parsed metrics & recommendations
+#       ├── qc_metrics_summary.csv
+#       └── fastp_params.json
+#
+# Usage:
+#   snakemake -s Snakefile_qualitycontrol \
+#       --use-conda --cores 16 -p
+#
+# Dry run (preview without execution):
+#   snakemake -s Snakefile_qualitycontrol \
+#       --use-conda --cores 16 --dry-run -p

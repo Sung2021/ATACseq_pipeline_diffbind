@@ -1,0 +1,282 @@
+"""
+FASTQ Quality Control & Preprocessing Pipeline
+============================================
+
+Standalone Snakemake workflow for:
+1. FastQC (per-sample quality assessment)
+2. MultiQC (aggregated report)
+3. QC metrics parsing
+4. fastp parameter determination
+5. fastp execution (adapter trimming, quality filtering)
+6. (Optional) Re-run FastQC on processed reads
+
+Usage:
+    snakemake -s Snakefile_qualitycontrol --use-conda --cores 16 -p
+    snakemake -s Snakefile_qualitycontrol --use-conda --cores 16 --profile slurm
+    
+    # Dry run
+    snakemake -s Snakefile_qualitycontrol --use-conda --cores 16 --dry-run
+
+Configuration:
+    - config/preprocessing_qc.yaml
+    
+Input:
+    - FASTQ files in: data/raw_fastq/
+    - Expected naming: {sample}_R1.fastq.gz, {sample}_R2.fastq.gz
+    
+Output:
+    - results/qc/fastqc/     → FastQC HTML reports
+    - results/qc/multiqc/    → MultiQC HTML report
+    - results/trimmed/       → fastp-processed reads
+    - results/qc_metrics/    → Parsed QC metrics
+"""
+
+import pandas as pd
+from pathlib import Path
+import glob
+
+# ─── Configuration ──────────────────────────────────────────────────────────
+configfile: "config/preprocessing_qc.yaml"
+
+# ─── Input directory and samples ─────────────────────────────────────────────
+FASTQ_DIR = config.get("raw_fastq_dir", "data/raw_fastq")
+RESULTS = config.get("results_dir", "results")
+PAIRED_END = config.get("paired_end", True)
+
+# Auto-detect samples from FASTQ directory
+def get_samples():
+    """Extract sample names from FASTQ files in FASTQ_DIR"""
+    fastq_files = glob.glob(f"{FASTQ_DIR}/*.fastq.gz")
+    samples = set()
+    for f in fastq_files:
+        # Expected format: {sample}_R1.fastq.gz or {sample}_R2.fastq.gz
+        basename = Path(f).stem.replace(".fastq", "")
+        # Remove _R1/_R2 suffix
+        sample = basename.replace("_R1", "").replace("_R2", "")
+        samples.add(sample)
+    return sorted(list(samples))
+
+SAMPLES = get_samples()
+
+if not SAMPLES:
+    raise Exception(f"No FASTQ files found in {FASTQ_DIR}. "
+                    "Please check directory path and file naming.")
+
+print(f"[QC Pipeline] Detected {len(SAMPLES)} samples:")
+for s in SAMPLES:
+    print(f"  - {s}")
+
+# ─── Global paths ──────────────────────────────────────────────────────────
+QC_DIR = f"{RESULTS}/qc"
+FASTQC_DIR = f"{QC_DIR}/fastqc"
+MULTIQC_DIR = f"{QC_DIR}/multiqc"
+TRIMMED_DIR = f"{RESULTS}/trimmed"
+METRICS_DIR = f"{RESULTS}/qc_metrics"
+
+# ─── Target rule ───────────────────────────────────────────────────────────
+rule all:
+    input:
+        # Step 1: FastQC (raw)
+        expand(f"{FASTQC_DIR}/{{sample}}_R1_fastqc.html", sample=SAMPLES),
+        expand(f"{FASTQC_DIR}/{{sample}}_R2_fastqc.html", sample=SAMPLES) if PAIRED_END else [],
+        
+        # Step 2: MultiQC (raw)
+        f"{MULTIQC_DIR}/multiqc_report_raw.html",
+        
+        # Step 3: QC metrics parsing
+        f"{METRICS_DIR}/qc_metrics_summary.csv",
+        f"{METRICS_DIR}/fastp_params_recommendation.txt",
+        
+        # Step 4: fastp trimming
+        expand(f"{TRIMMED_DIR}/{{sample}}_R1.trimmed.fastq.gz", sample=SAMPLES),
+        expand(f"{TRIMMED_DIR}/{{sample}}_R2.trimmed.fastq.gz", sample=SAMPLES) if PAIRED_END else [],
+        expand(f"{TRIMMED_DIR}/{{sample}}.fastp.json", sample=SAMPLES),
+        
+        # Step 5 (Optional): Re-run FastQC on trimmed reads
+        expand(f"{FASTQC_DIR}/{{sample}}_R1.trimmed_fastqc.html", sample=SAMPLES),
+        expand(f"{FASTQC_DIR}/{{sample}}_R2.trimmed_fastqc.html", sample=SAMPLES) if PAIRED_END else [],
+        
+        # Step 6 (Optional): MultiQC after trimming
+        f"{MULTIQC_DIR}/multiqc_report_trimmed.html"
+
+# ─── Rule 1: FastQC on raw reads ────────────────────────────────────────────
+rule fastqc_raw:
+    input:
+        fastq = lambda wildcards: f"{FASTQ_DIR}/{wildcards.sample}_{{read}}.fastq.gz"
+    output:
+        html = f"{FASTQC_DIR}/{{sample}}_{{read}}_fastqc.html",
+        zip = f"{FASTQC_DIR}/{{sample}}_{{read}}_fastqc.zip"
+    params:
+        outdir = FASTQC_DIR
+    threads: 2
+    resources:
+        mem_mb = 4000,
+        time_min = 30
+    conda:
+        "envs/qc.yaml"
+    shell:
+        """
+        fastqc -t {threads} -o {params.outdir} {input.fastq}
+        """
+
+# ─── Rule 2: MultiQC on raw reads ──────────────────────────────────────────
+rule multiqc_raw:
+    input:
+        fastqc = expand(f"{FASTQC_DIR}/{{sample}}_R1_fastqc.zip", sample=SAMPLES),
+        fastqc_r2 = expand(f"{FASTQC_DIR}/{{sample}}_R2_fastqc.zip", sample=SAMPLES) if PAIRED_END else []
+    output:
+        html = f"{MULTIQC_DIR}/multiqc_report_raw.html",
+        stats = f"{MULTIQC_DIR}/multiqc_data/multiqc_general_stats.txt"
+    params:
+        outdir = MULTIQC_DIR,
+        input_dir = FASTQC_DIR
+    conda:
+        "envs/qc.yaml"
+    shell:
+        """
+        multiqc {params.input_dir} -o {params.outdir} \
+            --filename multiqc_report_raw.html \
+            --force --quiet
+        """
+
+# ─── Rule 3: Parse QC metrics ──────────────────────────────────────────────
+rule parse_qc_metrics:
+    input:
+        multiqc_stats = f"{MULTIQC_DIR}/multiqc_data/multiqc_general_stats.txt"
+    output:
+        qc_csv = f"{METRICS_DIR}/qc_metrics_summary.csv"
+    params:
+        script = "scripts/parse_fastqc.py",
+        fastqc_dir = FASTQC_DIR
+    conda:
+        "envs/qc.yaml"
+    shell:
+        """
+        python {params.script} \
+            --fastqc-dir {params.fastqc_dir} \
+            --output {output.qc_csv}
+        """
+
+# ─── Rule 4: Determine fastp parameters ────────────────────────────────────
+rule determine_fastp_params:
+    input:
+        qc_metrics = f"{METRICS_DIR}/qc_metrics_summary.csv"
+    output:
+        params_txt = f"{METRICS_DIR}/fastp_params_recommendation.txt",
+        params_json = f"{METRICS_DIR}/fastp_params.json"
+    params:
+        script = "scripts/determine_fastp_params.py",
+        min_quality = config.get("min_quality", 20),
+        min_length = config.get("min_length", 20)
+    conda:
+        "envs/qc.yaml"
+    shell:
+        """
+        python {params.script} \
+            --qc-metrics {input.qc_metrics} \
+            --min-quality {params.min_quality} \
+            --min-length {params.min_length} \
+            --output-txt {output.params_txt} \
+            --output-json {output.params_json}
+        """
+
+# ─── Rule 5: fastp trimming ────────────────────────────────────────────────
+rule fastp_trim:
+    input:
+        r1 = f"{FASTQ_DIR}/{{sample}}_R1.fastq.gz",
+        r2 = f"{FASTQ_DIR}/{{sample}}_R2.fastq.gz" if PAIRED_END else [],
+        params_json = f"{METRICS_DIR}/fastp_params.json"
+    output:
+        r1_trimmed = f"{TRIMMED_DIR}/{{sample}}_R1.trimmed.fastq.gz",
+        r2_trimmed = f"{TRIMMED_DIR}/{{sample}}_R2.trimmed.fastq.gz" if PAIRED_END else [],
+        json_report = f"{TRIMMED_DIR}/{{sample}}.fastp.json",
+        html_report = f"{TRIMMED_DIR}/{{sample}}.fastp.html"
+    params:
+        quality = config.get("min_quality", 20),
+        min_length = config.get("min_length", 20)
+    threads: 4
+    resources:
+        mem_mb = 8000,
+        time_min = 60
+    conda:
+        "envs/qc.yaml"
+    shell:
+        """
+        if [ "{PAIRED_END}" = "True" ]; then
+            fastp -i {input.r1} -I {input.r2} \
+                   -o {output.r1_trimmed} -O {output.r2_trimmed} \
+                   -q {params.quality} \
+                   -l {params.min_length} \
+                   --thread {threads} \
+                   --json {output.json_report} \
+                   --html {output.html_report} \
+                   --adapter_sequence auto \
+                   --detect_adapter_for_pe
+        else
+            fastp -i {input.r1} \
+                   -o {output.r1_trimmed} \
+                   -q {params.quality} \
+                   -l {params.min_length} \
+                   --thread {threads} \
+                   --json {output.json_report} \
+                   --html {output.html_report} \
+        fi
+        """
+
+# ─── Rule 6: FastQC on trimmed reads ────────────────────────────────────────
+rule fastqc_trimmed:
+    input:
+        fastq = f"{TRIMMED_DIR}/{{sample}}_{{read}}.trimmed.fastq.gz"
+    output:
+        html = f"{FASTQC_DIR}/{{sample}}_{{read}}.trimmed_fastqc.html",
+        zip = f"{FASTQC_DIR}/{{sample}}_{{read}}.trimmed_fastqc.zip"
+    params:
+        outdir = FASTQC_DIR
+    threads: 2
+    resources:
+        mem_mb = 4000,
+        time_min = 30
+    conda:
+        "envs/qc.yaml"
+    shell:
+        """
+        fastqc -t {threads} -o {params.outdir} {input.fastq}
+        """
+
+# ─── Rule 7: MultiQC on trimmed reads ──────────────────────────────────────
+rule multiqc_trimmed:
+    input:
+        fastqc = expand(f"{FASTQC_DIR}/{{sample}}_R1.trimmed_fastqc.zip", sample=SAMPLES),
+        fastqc_r2 = expand(f"{FASTQC_DIR}/{{sample}}_R2.trimmed_fastqc.zip", sample=SAMPLES) if PAIRED_END else [],
+        fastp_reports = expand(f"{TRIMMED_DIR}/{{sample}}.fastp.json", sample=SAMPLES)
+    output:
+        html = f"{MULTIQC_DIR}/multiqc_report_trimmed.html"
+    params:
+        outdir = MULTIQC_DIR,
+        input_dir = FASTQC_DIR
+    conda:
+        "envs/qc.yaml"
+    shell:
+        """
+        multiqc {params.input_dir} {TRIMMED_DIR} \
+            -o {params.outdir} \
+            --filename multiqc_report_trimmed.html \
+            --force --quiet
+        """
+
+# ─── On success ────────────────────────────────────────────────────────────
+onsuccess:
+    print("\n" + "="*70)
+    print("✓ FASTQ QC and preprocessing pipeline completed successfully!")
+    print("="*70)
+    print(f"\nKey outputs:")
+    print(f"  Raw QC report:      {MULTIQC_DIR}/multiqc_report_raw.html")
+    print(f"  Trimmed reads:      {TRIMMED_DIR}/")
+    print(f"  Trimmed QC report:  {MULTIQC_DIR}/multiqc_report_trimmed.html")
+    print(f"  QC metrics:         {METRICS_DIR}/qc_metrics_summary.csv")
+    print("\nNext step: Use trimmed reads for BAM alignment (bwa, bowtie2, etc.)\n")
+
+onerror:
+    print("\n" + "="*70)
+    print("✗ Pipeline error occurred. Check logs above.")
+    print("="*70 + "\n")

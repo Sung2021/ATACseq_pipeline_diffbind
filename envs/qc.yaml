@@ -1,0 +1,23 @@
+name: qc
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  # FastQC - Quality assessment
+  - fastqc=0.12.*
+  
+  # MultiQC - QC report aggregation
+  - multiqc=1.14.*
+  
+  # fastp - Read trimming and filtering
+  - fastp=0.23.*
+  
+  # Python data analysis
+  - python=3.10
+  - pandas=1.5.*
+  - numpy=1.23.*
+  
+  # Utilities
+  - samtools=1.16.*
+  - pigz=2.8         # Parallel zip/gzip
